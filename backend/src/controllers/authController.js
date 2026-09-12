@@ -200,7 +200,7 @@ async function login(req, res, next) {
       // Fetch user
       const { rows } = await client.query(
         `SELECT id, username, password, name, role, entity_id, email,
-                is_active, must_change_password, totp_enabled, totp_secret
+                is_active, must_change_password, totp_enabled, totp_secret, is_owner
          FROM users
          WHERE username = $1 AND is_active = TRUE`,
         [username.trim().toLowerCase()]
@@ -268,6 +268,7 @@ async function login(req, res, next) {
       role:               result.role,
       entity_id:          result.entity_id,
       mustChangePassword: result.must_change_password || false,
+      is_owner:           result.is_owner || false,
       permissions,          // ← RBAC: array of 'module:action' keys
       // Multi-tenant fields — undefined in single-tenant mode (cleaner than null)
       ...(tenantInfo && {

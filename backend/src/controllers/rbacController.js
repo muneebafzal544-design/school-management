@@ -18,6 +18,27 @@ function invalidateRbacCache(schema) {
   cache.delPattern(`${pfx}permissions*`).catch(() => {});
 }
 
+// Admin-level accounts (role='admin') can only be created/reset/deactivated
+// by the school's Owner — a regular admin still manages teacher/student/
+// parent accounts freely. Throws 403 if the caller isn't an owner.
+function assertOwnerForAdminTarget(req, targetRole) {
+  if (targetRole !== 'admin') return;
+  if (req.user.role !== 'admin' || !req.user.is_owner) {
+    throw new AppError('Only the school owner can manage admin accounts.', 403, 'OWNER_REQUIRED');
+  }
+}
+
+// Refuses an action that would leave the school with zero active owners.
+async function assertNotLastOwner(userId) {
+  const { rows: [{ count }] } = await db.query(
+    `SELECT COUNT(*) FROM users WHERE role='admin' AND is_owner=TRUE AND is_active=TRUE AND id != $1`,
+    [userId]
+  );
+  if (parseInt(count, 10) === 0) {
+    throw new AppError('This is the last remaining owner — promote another admin to owner first.', 400, 'LAST_OWNER');
+  }
+}
+
 // ── GET /api/rbac/permissions ─────────────────────────────────────────────────
 // Returns all permissions grouped by module, with sort_order.
 async function listPermissions(req, res) {
@@ -262,7 +283,7 @@ async function listUsers(req, res) {
   params.push(+limit, +offset);
 
   const { rows } = await db.query(
-    `SELECT u.id, u.username, u.name, u.role, u.entity_id, u.created_at,
+    `SELECT u.id, u.username, u.name, u.role, u.entity_id, u.created_at, u.is_owner,
             r.label AS role_label, r.color AS role_color,
             COUNT(rp.permission_id)::INT AS permission_count
      FROM users u
@@ -294,6 +315,17 @@ async function setUserRole(req, res) {
   if (+userId === req.user.id && role !== 'admin') {
     throw new AppError('You cannot remove your own admin role', 400);
   }
+
+  const { rows: [target] } = await db.query(
+    `SELECT role AS current_role, is_owner FROM users WHERE id = $1 AND is_active = TRUE`, [userId]
+  );
+  if (!target) throw new AppError('User not found', 404);
+
+  // Touching an admin-level account (moving into OR out of it) is owner-only
+  assertOwnerForAdminTarget(req, target.current_role);
+  assertOwnerForAdminTarget(req, role);
+  // Demoting the last owner out of admin would leave the school ownerless
+  if (target.is_owner && role !== 'admin') await assertNotLastOwner(userId);
 
   // Validate role exists
   const { rows: [roleRow] } = await db.query(
@@ -429,6 +461,8 @@ async function createUser(req, res) {
   if (!username?.trim()) throw new AppError('username is required', 400);
   if (!role)             throw new AppError('role is required', 400);
 
+  assertOwnerForAdminTarget(req, role);
+
   const clean = username.trim().toLowerCase().replace(/\s+/g, '_');
 
   // Validate role exists
@@ -464,6 +498,14 @@ async function deactivateUser(req, res) {
   const { userId } = req.params;
   if (+userId === req.user.id) throw new AppError('Cannot deactivate your own account', 400);
 
+  const { rows: [target] } = await db.query(
+    `SELECT role, is_owner FROM users WHERE id = $1 AND is_active = TRUE`, [userId]
+  );
+  if (!target) throw new AppError('User not found or already inactive', 404);
+
+  assertOwnerForAdminTarget(req, target.role);
+  if (target.is_owner) await assertNotLastOwner(userId);
+
   const { rows: [user] } = await db.query(
     `UPDATE users SET is_active = FALSE WHERE id = $1 AND is_active = TRUE RETURNING id, name`,
     [userId]
@@ -472,6 +514,34 @@ async function deactivateUser(req, res) {
 
   logAction({ userId: req.user.id, username: req.user.username, action: 'USER_DEACTIVATE', resource: 'users', resourceId: userId, details: { target_user: user.name }, req }).catch(() => {});
   res.json({ success: true, message: `User "${user.name}" deactivated` });
+}
+
+// ── POST /api/rbac/users/:userId/reset-password ───────────────────────────────
+// Reset another user's password to a fresh auto-generated temp password.
+// Resetting an admin-level account is owner-only (see assertOwnerForAdminTarget).
+async function resetUserPassword(req, res) {
+  const { userId } = req.params;
+
+  const { rows: [target] } = await db.query(
+    `SELECT role, name, username FROM users WHERE id = $1 AND is_active = TRUE`, [userId]
+  );
+  if (!target) throw new AppError('User not found', 404);
+
+  assertOwnerForAdminTarget(req, target.role);
+
+  const rawPw  = genTempPassword();
+  const hashed = await bcrypt.hash(rawPw, 10);
+  await db.query(
+    `UPDATE users SET password = $1, must_change_password = TRUE WHERE id = $2`,
+    [hashed, userId]
+  );
+
+  logAction({ userId: req.user.id, username: req.user.username, action: 'USER_PASSWORD_RESET', resource: 'users', resourceId: userId, details: { target_user: target.name }, req }).catch(() => {});
+  res.json({
+    success: true,
+    credentials: { username: target.username, tempPassword: rawPw },
+    message: `Password reset for "${target.name}". Share the temporary password — it will not be shown again.`,
+  });
 }
 
 module.exports = {
@@ -489,4 +559,5 @@ module.exports = {
   getSummary,
   createUser,
   deactivateUser,
+  resetUserPassword,
 };

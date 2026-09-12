@@ -258,7 +258,7 @@ export default function Sidebar({ open, onClose, onSearch }) {
             </div>
             <div className="flex-1 min-w-0">
               <p className="text-[13px] font-bold text-white truncate leading-none">{user.name}</p>
-              <p className="text-[10px] text-slate-500 mt-0.5 capitalize">{user.role}</p>
+              <p className="text-[10px] text-slate-500 mt-0.5 capitalize">{user.is_owner ? 'Owner' : user.role}</p>
             </div>
           </div>
         )}

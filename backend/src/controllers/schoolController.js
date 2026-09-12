@@ -122,12 +122,14 @@ const createSchool = async (req, res) => {
     // 4. Run all migrations inside the new schema
     await runMigrationsForSchema(client, schema);
 
-    // 5. Create default admin user inside the tenant schema
+    // 5. Create default admin user inside the tenant schema — the founding
+    // admin is the school's Owner (is_owner=TRUE): the only one who can
+    // create/reset/deactivate other admin-level accounts later.
     const hash = await bcrypt.hash(admin_password, 10);
     await db.setSearchPath(client, schema);
     await client.query(
-      `INSERT INTO users (username, password, name, role, must_change_password)
-       VALUES ($1, $2, $3, 'admin', false)`,
+      `INSERT INTO users (username, password, name, role, must_change_password, is_owner)
+       VALUES ($1, $2, $3, 'admin', false, TRUE)`,
       [admin_username, hash, admin_name]
     );
 
@@ -353,4 +355,34 @@ const seedDemoForSchool = async (req, res) => {
   }
 };
 
-module.exports = { createSchool, listSchools, resolveSchool, updateSchool, getSchoolStats, resetSchoolAdmin, seedDemoForSchool };
+// ── POST /api/schools/migrate-all ─────────────────────────────────────────────
+// Re-runs the tenant migration set against EVERY existing school schema.
+// runMigrationsForSchema only ever ran once, at createSchool() time — a school
+// provisioned before a new migration file was added never picks it up on its
+// own. Safe to call anytime: each tenant's own _migrations table means an
+// already-applied file is skipped, so this only ever applies what's new.
+const migrateAllSchools = async (req, res) => {
+  const { rows: schools } = await pool.query('SELECT id, name, slug FROM public.schools');
+  const results = [];
+  for (const school of schools) {
+    const schema = schemaName(school.slug);
+    const client = await pool.connect();
+    try {
+      await runMigrationsForSchema(client, schema);
+      results.push({ id: school.id, name: school.name, schema, status: 'ok' });
+    } catch (err) {
+      console.error(`[SCHOOL] migrateAllSchools (${schema}):`, err.message);
+      results.push({ id: school.id, name: school.name, schema, status: 'error', message: err.message });
+    } finally {
+      client.release();
+    }
+  }
+  const failed = results.filter(r => r.status === 'error');
+  res.json({
+    success: failed.length === 0,
+    data: results,
+    message: `${results.length - failed.length}/${results.length} school(s) migrated successfully.`,
+  });
+};
+
+module.exports = { createSchool, listSchools, resolveSchool, updateSchool, getSchoolStats, resetSchoolAdmin, seedDemoForSchool, migrateAllSchools };

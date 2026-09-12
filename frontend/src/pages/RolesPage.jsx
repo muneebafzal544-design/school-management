@@ -20,6 +20,7 @@ import {
   deleteRole, setRolePerms, getRbacUsers, setUserRole,
   createRbacUser, deactivateUser,
 } from '../api/rbac';
+import { useAuth } from '../context/AuthContext';
 
 // ── Module display names & icons ──────────────────────────────────────────────
 const MODULE_META = {
@@ -219,8 +220,10 @@ function CreateRoleModal({ onClose, onCreated }) {
 }
 
 // ── Create User Modal ─────────────────────────────────────────────────────────
-function CreateUserModal({ roles, onClose, onCreated }) {
-  const [form, setForm]     = useState({ name: '', username: '', role: roles[0]?.name || 'teacher' });
+function CreateUserModal({ roles, onClose, onCreated, isOwnerViewer }) {
+  // Only the school Owner can create another admin-level account.
+  const selectableRoles = isOwnerViewer ? roles : roles.filter(r => r.name !== 'admin');
+  const [form, setForm]     = useState({ name: '', username: '', role: selectableRoles[0]?.name || 'teacher' });
   const [saving, setSaving] = useState(false);
   const [done, setDone]     = useState(null); // credentials after creation
 
@@ -297,8 +300,9 @@ function CreateUserModal({ roles, onClose, onCreated }) {
             <div>
               <label className="text-sm font-medium text-slate-600 dark:text-slate-400">Role</label>
               <select value={form.role} onChange={e => setForm(f => ({ ...f, role: e.target.value }))} className={inputCls} required>
-                {roles.map(r => <option key={r.id} value={r.name}>{r.label}</option>)}
+                {selectableRoles.map(r => <option key={r.id} value={r.name}>{r.label}</option>)}
               </select>
+              {!isOwnerViewer && <p className="text-xs text-slate-400 mt-1">Only the school owner can create another admin account.</p>}
             </div>
             <p className="text-xs text-slate-400">A temporary password will be auto-generated. The user must change it on first login.</p>
             <div className="flex gap-2 pt-1">
@@ -321,6 +325,8 @@ function CreateUserModal({ roles, onClose, onCreated }) {
 
 // ── Users Tab ─────────────────────────────────────────────────────────────────
 function UsersTab({ roles }) {
+  const { user: viewer } = useAuth();
+  const isOwnerViewer = viewer?.role === 'admin' && !!viewer?.is_owner;
   const [users,       setUsers]       = useState([]);
   const [loading,     setLoading]     = useState(true);
   const [search,      setSearch]      = useState('');
@@ -433,28 +439,38 @@ function UsersTab({ roles }) {
                       style={{ backgroundColor: user.role_color || '#6366f1' }}>
                       {user.role_label || user.role}
                     </span>
+                    {user.is_owner && (
+                      <span className="ml-1.5 inline-flex items-center px-2 py-1 rounded-full bg-amber-100 dark:bg-amber-900/30 text-amber-700 dark:text-amber-400 text-[10px] font-bold">
+                        👑 Owner
+                      </span>
+                    )}
                   </td>
                   <td className="px-4 py-3 text-slate-500 dark:text-slate-400 text-xs">
                     {user.role === 'admin' ? '∞ All' : `${user.permission_count ?? 0} permissions`}
                   </td>
                   <td className="px-4 py-3">
-                    <div className="flex items-center gap-2">
-                      <select
-                        value={user.role}
-                        onChange={e => handleRoleChange(user.id, e.target.value, user.role)}
-                        disabled={changing === user.id}
-                        className="rounded-lg border border-slate-200 dark:border-slate-600 bg-white dark:bg-slate-700 text-slate-800 dark:text-slate-100 px-2 py-1.5 text-xs focus:outline-none focus:ring-2 focus:ring-indigo-400 disabled:opacity-50"
-                      >
-                        {roles.map(r => <option key={r.id} value={r.name}>{r.label}</option>)}
-                      </select>
-                      {changing === user.id && <Spinner />}
-                    </div>
+                    {/* Only the owner can touch an admin-level account's role */}
+                    {user.role === 'admin' && !isOwnerViewer ? (
+                      <span className="text-xs text-slate-400" title="Only the school owner can change an admin's role">🔒 Owner-only</span>
+                    ) : (
+                      <div className="flex items-center gap-2">
+                        <select
+                          value={user.role}
+                          onChange={e => handleRoleChange(user.id, e.target.value, user.role)}
+                          disabled={changing === user.id}
+                          className="rounded-lg border border-slate-200 dark:border-slate-600 bg-white dark:bg-slate-700 text-slate-800 dark:text-slate-100 px-2 py-1.5 text-xs focus:outline-none focus:ring-2 focus:ring-indigo-400 disabled:opacity-50"
+                        >
+                          {(isOwnerViewer ? roles : roles.filter(r => r.name !== 'admin')).map(r => <option key={r.id} value={r.name}>{r.label}</option>)}
+                        </select>
+                        {changing === user.id && <Spinner />}
+                      </div>
+                    )}
                   </td>
                   <td className="px-4 py-3 text-right">
                     <button
                       onClick={() => handleDeactivate(user)}
-                      disabled={deactivating === user.id}
-                      title="Deactivate user"
+                      disabled={deactivating === user.id || (user.role === 'admin' && !isOwnerViewer)}
+                      title={user.role === 'admin' && !isOwnerViewer ? 'Only the school owner can deactivate an admin' : 'Deactivate user'}
                       className="p-1.5 rounded-lg text-slate-400 hover:text-red-500 hover:bg-red-50 dark:hover:bg-red-900/20 transition-colors disabled:opacity-40"
                     >
                       {deactivating === user.id ? <Spinner /> : '🚫'}
@@ -477,6 +493,7 @@ function UsersTab({ roles }) {
       {showCreate && (
         <CreateUserModal
           roles={roles}
+          isOwnerViewer={isOwnerViewer}
           onClose={() => setShowCreate(false)}
           onCreated={() => { loadUsers(); }}
         />

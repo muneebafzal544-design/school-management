@@ -15,6 +15,7 @@ const {
   getSummary,
   createUser,
   deactivateUser,
+  resetUserPassword,
 } = require('../controllers/rbacController');
 const { cacheRoute } = require('../cache/cacheMiddleware');
 
@@ -39,6 +40,7 @@ router.get   ('/users',                       listUsers);
 router.post  ('/users',                       createUser);
 router.put   ('/users/:userId/role',          setUserRole);
 router.delete('/users/:userId',               deactivateUser);
+router.post  ('/users/:userId/reset-password',resetUserPassword);
 router.get   ('/users/:userId/permissions',   getUserPermissions);
 router.put   ('/users/:userId/permissions',   setUserPermissions);
 
