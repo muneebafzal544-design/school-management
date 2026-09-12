@@ -2,6 +2,8 @@ const bcrypt = require('bcryptjs');
 const fs     = require('fs');
 const path   = require('path');
 const db     = require('../db');
+const { genTempPassword } = require('../utils/genTempPassword');
+const { seedDemoData }    = require('../db/seedDemoData');
 
 // db.raw = the underlying pg Pool — bypasses schema injection.
 // All DDL / provisioning work uses db.raw directly.
@@ -69,13 +71,27 @@ const createSchool = async (req, res) => {
       email,
       admin_username = 'admin',
       admin_name     = 'Administrator',
-      admin_password,
-      plan           = 'standard',
+      is_demo        = false,
     } = req.body;
+    let { admin_password, plan = 'standard', expires_at = null } = req.body;
 
     if (!name?.trim())        return res.status(400).json({ success: false, message: 'School name required' });
     if (!school_code?.trim()) return res.status(400).json({ success: false, message: 'School code required' });
-    if (!admin_password)      return res.status(400).json({ success: false, message: 'Admin password required' });
+
+    // Demo schools: force a trial plan + 7-day expiry, and auto-generate the
+    // admin password if the caller didn't supply one (fastest path to
+    // handing a prospect a working login).
+    let generatedPassword = null;
+    if (is_demo) {
+      plan       = 'trial';
+      expires_at = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString();
+      if (!admin_password) {
+        generatedPassword = genTempPassword();
+        admin_password     = generatedPassword;
+      }
+    }
+
+    if (!admin_password) return res.status(400).json({ success: false, message: 'Admin password required' });
 
     const slug   = slugify(name.trim());
     const schema = schemaName(slug);
@@ -94,10 +110,10 @@ const createSchool = async (req, res) => {
 
     // 2. Insert into public.schools
     const { rows: [school] } = await client.query(
-      `INSERT INTO public.schools (name, slug, school_code, city, phone, email, plan)
-       VALUES ($1, $2, $3, $4, $5, $6, $7)
+      `INSERT INTO public.schools (name, slug, school_code, city, phone, email, plan, expires_at, is_demo)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
        RETURNING *`,
-      [name.trim(), slug, code, city || null, phone || null, email || null, plan]
+      [name.trim(), slug, code, city || null, phone || null, email || null, plan, expires_at, is_demo]
     );
 
     // 3. Create the tenant schema
@@ -133,6 +149,24 @@ const createSchool = async (req, res) => {
 
     await client.query('COMMIT');
 
+    // Demo data seeding runs AFTER the provisioning transaction has already
+    // committed, on its own connection — if it fails, the school still
+    // exists (just unseeded) rather than losing the whole ~111-migration
+    // transaction to a rollback over what should be a cheap, retryable step.
+    let seedWarning = null;
+    let seedSummary = null;
+    if (is_demo) {
+      const seedClient = await pool.connect();
+      try {
+        seedSummary = await seedDemoData(seedClient, schema);
+      } catch (seedErr) {
+        console.error('[SCHOOL] seedDemoData:', seedErr.message);
+        seedWarning = 'School created, but demo data seeding failed — you can retry it from the school\'s Manage panel.';
+      } finally {
+        seedClient.release();
+      }
+    }
+
     res.status(201).json({
       success: true,
       data: {
@@ -142,11 +176,15 @@ const createSchool = async (req, res) => {
         slug,
         schema,
         admin_username,
+        admin_password: generatedPassword || undefined,
+        is_demo,
+        expires_at:     school.expires_at,
+        seed_summary:   seedSummary,
         created_at:     school.created_at,
       },
-      message: `School "${name.trim()}" provisioned — schema "${schema}" created with ${
+      message: seedWarning || `School "${name.trim()}" provisioned — schema "${schema}" created with ${
         fs.readdirSync(MIGRATIONS_DIR).filter(f => f.endsWith('.sql')).length - 1
-      } migrations applied.`,
+      } migrations applied.${is_demo ? ' Demo data seeded.' : ''}`,
     });
   } catch (err) {
     await client.query('ROLLBACK');
@@ -166,7 +204,8 @@ const listSchools = async (req, res) => {
               EXISTS (
                 SELECT 1 FROM information_schema.schemata
                 WHERE schema_name = 'school_' || s.slug
-              ) AS schema_exists
+              ) AS schema_exists,
+              (s.expires_at IS NOT NULL AND s.expires_at < NOW()) AS is_expired
        FROM public.schools s
        ORDER BY s.created_at DESC`
     );
@@ -186,7 +225,7 @@ const resolveSchool = async (req, res) => {
     if (!code) return res.status(400).json({ success: false, message: 'code required' });
 
     const { rows: [school] } = await pool.query(
-      `SELECT id, name, slug, school_code, logo_url, city, status
+      `SELECT id, name, slug, school_code, logo_url, city, status, expires_at
        FROM public.schools WHERE school_code = $1`,
       [code]
     );
@@ -195,6 +234,9 @@ const resolveSchool = async (req, res) => {
     }
     if (school.status !== 'active') {
       return res.status(403).json({ success: false, message: 'School account is inactive. Contact support.' });
+    }
+    if (school.expires_at && new Date(school.expires_at) < new Date()) {
+      return res.status(403).json({ success: false, message: 'Your trial has expired. Please contact us to continue.' });
     }
     res.json({ success: true, data: school });
   } catch (err) {
@@ -281,4 +323,34 @@ const resetSchoolAdmin = async (req, res) => {
   }
 };
 
-module.exports = { createSchool, listSchools, resolveSchool, updateSchool, getSchoolStats, resetSchoolAdmin };
+// ── POST /api/schools/:id/seed-demo ───────────────────────────────────────────
+// Retries demo data seeding for a school whose initial seed failed.
+// Guarded against double-seeding: refuses if the tenant already has students.
+const seedDemoForSchool = async (req, res) => {
+  try {
+    const { rows: [school] } = await pool.query(
+      'SELECT slug, is_demo FROM public.schools WHERE id=$1', [req.params.id]
+    );
+    if (!school) return res.status(404).json({ success: false, message: 'School not found' });
+    if (!school.is_demo) return res.status(400).json({ success: false, message: 'This is not a demo school' });
+
+    const schema = schemaName(school.slug);
+    const client = await pool.connect();
+    try {
+      await db.setSearchPath(client, schema);
+      const { rows: [{ count }] } = await client.query('SELECT COUNT(*) FROM students');
+      if (parseInt(count, 10) > 0) {
+        return res.status(409).json({ success: false, message: 'This school already has data — seeding was not retried to avoid duplicates.' });
+      }
+      const summary = await seedDemoData(client, schema);
+      res.json({ success: true, data: summary, message: 'Demo data seeded.' });
+    } finally {
+      client.release();
+    }
+  } catch (err) {
+    console.error('[SCHOOL] seedDemoForSchool:', err.message);
+    res.status(500).json({ success: false, message: err.message });
+  }
+};
+
+module.exports = { createSchool, listSchools, resolveSchool, updateSchool, getSchoolStats, resetSchoolAdmin, seedDemoForSchool };

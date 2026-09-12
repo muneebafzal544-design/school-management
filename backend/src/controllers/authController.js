@@ -54,7 +54,7 @@ function getClientIp(req) {
  */
 async function resolveSchoolByCode(code) {
   const { rows: [school] } = await db.raw.query(
-    `SELECT name, slug, school_code, status
+    `SELECT name, slug, school_code, status, expires_at
      FROM public.schools
      WHERE school_code = $1`,
     [code.toUpperCase().trim()]
@@ -70,6 +70,12 @@ async function resolveSchoolByCode(code) {
     throw new AppError(
       'School account is inactive. Please contact support.',
       403, 'SCHOOL_INACTIVE'
+    );
+  }
+  if (school.expires_at && new Date(school.expires_at) < new Date()) {
+    throw new AppError(
+      'Your trial has expired. Please contact us to continue.',
+      403, 'TRIAL_EXPIRED'
     );
   }
 

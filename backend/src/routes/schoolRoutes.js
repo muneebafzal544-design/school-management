@@ -1,5 +1,5 @@
 const router = require('express').Router();
-const { createSchool, listSchools, resolveSchool, updateSchool, getSchoolStats, resetSchoolAdmin } = require('../controllers/schoolController');
+const { createSchool, listSchools, resolveSchool, updateSchool, getSchoolStats, resetSchoolAdmin, seedDemoForSchool } = require('../controllers/schoolController');
 const { requireSuperAdmin } = require('../middleware/authMiddleware');
 
 // ── Public ───────────────────────────────────────────────────────────────────
@@ -11,5 +11,6 @@ router.get('/',                requireSuperAdmin, listSchools);
 router.post('/',               requireSuperAdmin, createSchool);
 router.patch('/:id',           requireSuperAdmin, updateSchool);
 router.post('/:id/reset-admin',requireSuperAdmin, resetSchoolAdmin);
+router.post('/:id/seed-demo',  requireSuperAdmin, seedDemoForSchool);
 
 module.exports = router;
