@@ -339,8 +339,17 @@ app.get('/api/health/ready', async (_req, res) => {
 for (const prefix of ['/api', '/api/v1']) {
   app.use(`${prefix}/auth/login`, loginLimiter);
   app.use(`${prefix}/auth`, authRoutes);
-  // School resolve is public — login page calls it before JWT exists
-  app.use(`${prefix}/schools/resolve`, schoolRoutes);
+  // School resolve is public — login page calls it before JWT exists.
+  // Mounted at the router's own base path (not .../resolve) so its internal
+  // `/resolve` route actually matches — mounting at `.../schools/resolve`
+  // required the request to be `.../schools/resolve/resolve` to match,
+  // silently falling through to the authenticated mount further down and
+  // returning 401 instead of ever reaching resolveSchool(). The rest of
+  // schoolRoutes (create/list/update) stays safe here too: those routes
+  // carry their own `requireSuperAdmin` guard, which independently checks
+  // `req.user` and rejects when it's unset (global verifyToken hasn't run
+  // yet at this point in the middleware chain).
+  app.use(`${prefix}/schools`, schoolRoutes);
   // Payment gateway callbacks are public — JazzCash/EasyPaisa POST here (no JWT)
   app.use(`${prefix}/online-payments`, onlinePaymentRoutes);
 }
@@ -419,7 +428,11 @@ const routeMap = [
   ['/automation',           automationRoutes],
   ['/study-planner',        studyPlannerRoutes],
   ['/parent-feed',          parentFeedRoutes],
-  ['/schools',              schoolRoutes],
+  // NOTE: schoolRoutes is mounted earlier (pre-auth, see the public-routes
+  // block above) so its own /resolve route can be reached without a JWT —
+  // it is NOT listed here too, since that mount already handles every
+  // /api/schools/* path (its protected routes still enforce
+  // requireSuperAdmin individually).
   ['/whatsapp',             whatsappRoutes],
   ['/risk',                 riskRoutes],
   ['/audit',                auditRoutes],

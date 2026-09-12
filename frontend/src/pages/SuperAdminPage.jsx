@@ -16,6 +16,13 @@ const PLAN_STYLE = {
   standard:   'bg-slate-100 text-slate-600 dark:bg-slate-800 dark:text-slate-400',
   pro:        'bg-blue-100 text-blue-700 dark:bg-blue-900/30 dark:text-blue-400',
   enterprise: 'bg-purple-100 text-purple-700 dark:bg-purple-900/30 dark:text-purple-400',
+  trial:      'bg-amber-100 text-amber-700 dark:bg-amber-900/30 dark:text-amber-400',
+};
+
+/** Days remaining until expires_at (negative once expired). */
+const daysLeft = (expiresAt) => {
+  if (!expiresAt) return null;
+  return Math.ceil((new Date(expiresAt).getTime() - Date.now()) / 86_400_000);
 };
 const STATUS_STYLE = {
   active:    'bg-emerald-100 text-emerald-700 dark:bg-emerald-900/30 dark:text-emerald-400',
@@ -46,11 +53,12 @@ function StatCard({ icon: Icon, label, value, color, sub }) {
 function CreateSchoolPanel({ onClose, onCreated }) {
   const [form, setForm] = useState({
     name: '', school_code: '', city: '', phone: '', email: '',
-    admin_username: 'admin', admin_password: '', plan: 'standard',
+    admin_username: 'admin', admin_password: '', plan: 'standard', is_demo: false,
   });
   const [showPw,  setShowPw]  = useState(false);
   const [saving,  setSaving]  = useState(false);
   const [codeErr, setCodeErr] = useState('');
+  const [created, setCreated] = useState(null); // holds response data once a demo school is created, to show the generated password
 
   const set = (k, v) => setForm(f => ({ ...f, [k]: v }));
 
@@ -67,8 +75,8 @@ function CreateSchoolPanel({ onClose, onCreated }) {
     e.preventDefault();
     if (!form.name.trim())         return toast.error('School name required');
     if (!form.school_code.trim())  return toast.error('School code required');
-    if (!form.admin_password)      return toast.error('Admin password required');
-    if (form.admin_password.length < 8) return toast.error('Password must be 8+ characters');
+    if (!form.is_demo && !form.admin_password)      return toast.error('Admin password required');
+    if (form.admin_password && form.admin_password.length < 8) return toast.error('Password must be 8+ characters');
 
     setSaving(true);
     try {
@@ -76,7 +84,12 @@ function CreateSchoolPanel({ onClose, onCreated }) {
       const data = res.data?.data ?? res.data;
       toast.success(`"${data.name}" provisioned! Schema: ${data.schema}`);
       onCreated();
-      onClose();
+      if (data.admin_password) {
+        // Demo school with an auto-generated password — show it instead of closing immediately.
+        setCreated(data);
+      } else {
+        onClose();
+      }
     } catch (err) {
       const msg = err.response?.data?.message || 'Failed to create school';
       if (msg.toLowerCase().includes('code') || msg.toLowerCase().includes('name')) setCodeErr(msg);
@@ -85,6 +98,44 @@ function CreateSchoolPanel({ onClose, onCreated }) {
       setSaving(false);
     }
   };
+
+  // ── Post-creation: show the auto-generated demo password once ────────────
+  if (created) {
+    return (
+      <div className="fixed inset-0 z-50 flex">
+        <div className="flex-1 bg-black/40" onClick={onClose} />
+        <div className="w-full max-w-md bg-white dark:bg-slate-900 shadow-2xl overflow-y-auto flex flex-col">
+          <div className="px-6 py-5 border-b border-slate-100 dark:border-slate-800 flex items-center justify-between shrink-0">
+            <h2 className="font-bold text-slate-800 dark:text-white text-base">Demo Ready 🎉</h2>
+            <button onClick={onClose} className="p-1.5 rounded-lg hover:bg-slate-100 dark:hover:bg-slate-800">
+              <X size={18} className="text-slate-400" />
+            </button>
+          </div>
+          <div className="p-6 space-y-4">
+            <p className="text-sm text-slate-600 dark:text-slate-300">
+              <strong>{created.name}</strong> is live for 7 days. Share these login details with the school:
+            </p>
+            <div className="bg-amber-50 dark:bg-amber-900/20 border border-amber-200 dark:border-amber-800 rounded-xl p-4 space-y-2 text-sm">
+              <div className="flex justify-between"><span className="text-slate-500">School Code</span><code className="font-bold">{created.school_code}</code></div>
+              <div className="flex justify-between"><span className="text-slate-500">Username</span><code className="font-bold">{created.admin_username}</code></div>
+              <div className="flex justify-between"><span className="text-slate-500">Password</span><code className="font-bold">{created.admin_password}</code></div>
+              <div className="flex justify-between"><span className="text-slate-500">Expires</span><span className="font-semibold">{fmtDate(created.expires_at)}</span></div>
+            </div>
+            {created.seed_summary && (
+              <p className="text-xs text-slate-400">
+                Seeded with {created.seed_summary.students} students, {created.seed_summary.teachers} teachers, {created.seed_summary.classes} classes, and {created.seed_summary.invoices} fee invoices.
+              </p>
+            )}
+            <button onClick={onClose}
+              className="w-full py-2.5 rounded-xl text-white text-sm font-bold"
+              style={{ background: 'linear-gradient(135deg, #6366f1, #8b5cf6)' }}>
+              Done
+            </button>
+          </div>
+        </div>
+      </div>
+    );
+  }
 
   return (
     <div className="fixed inset-0 z-50 flex">
@@ -141,17 +192,35 @@ function CreateSchoolPanel({ onClose, onCreated }) {
             </div>
           </div>
 
+          {/* Demo toggle */}
+          <label className="flex items-start gap-3 bg-amber-50 dark:bg-amber-900/20 border border-amber-200 dark:border-amber-800 rounded-xl p-3 cursor-pointer">
+            <input type="checkbox" checked={form.is_demo}
+              onChange={e => set('is_demo', e.target.checked)}
+              className="mt-0.5 w-4 h-4 accent-amber-500" />
+            <span>
+              <span className="block text-sm font-bold text-amber-700 dark:text-amber-400">Create as 7-day demo</span>
+              <span className="block text-xs text-amber-600 dark:text-amber-500 mt-0.5">
+                Auto-expires in 7 days and comes pre-seeded with sample students, teachers, classes,
+                attendance, and fee data — a password is generated for you.
+              </span>
+            </span>
+          </label>
+
           {/* Plan */}
           <div>
             <label className="block text-xs font-semibold text-slate-500 mb-1.5">Subscription Plan</label>
-            <div className="relative">
-              <select value={form.plan} onChange={e => set('plan', e.target.value)} className={SEL}>
-                <option value="standard">Standard</option>
-                <option value="pro">Pro</option>
-                <option value="enterprise">Enterprise</option>
-              </select>
-              <ChevronDown size={14} className="absolute right-3 top-1/2 -translate-y-1/2 text-slate-400 pointer-events-none" />
-            </div>
+            {form.is_demo ? (
+              <div className={`${INPUT} bg-slate-50 dark:bg-slate-800/60 text-slate-500 dark:text-slate-400`}>Trial (7 days)</div>
+            ) : (
+              <div className="relative">
+                <select value={form.plan} onChange={e => set('plan', e.target.value)} className={SEL}>
+                  <option value="standard">Standard</option>
+                  <option value="pro">Pro</option>
+                  <option value="enterprise">Enterprise</option>
+                </select>
+                <ChevronDown size={14} className="absolute right-3 top-1/2 -translate-y-1/2 text-slate-400 pointer-events-none" />
+              </div>
+            )}
           </div>
 
           {/* Admin Account */}
@@ -165,27 +234,32 @@ function CreateSchoolPanel({ onClose, onCreated }) {
               placeholder="admin" className={INPUT} />
           </div>
 
-          <div>
-            <label className="block text-xs font-semibold text-slate-500 mb-1.5">Admin Password *</label>
-            <div className="relative">
-              <input type={showPw ? 'text' : 'password'} value={form.admin_password}
-                onChange={e => set('admin_password', e.target.value)}
-                placeholder="Min 8 characters" className={`${INPUT} pr-10`} />
-              <button type="button" onClick={() => setShowPw(s => !s)}
-                className="absolute right-3 top-1/2 -translate-y-1/2 text-slate-400 hover:text-slate-600">
-                {showPw ? <EyeOff size={15} /> : <Eye size={15} />}
-              </button>
+          {form.is_demo ? (
+            <p className="text-xs text-slate-400 -mt-1">A secure password will be generated automatically and shown to you after creation.</p>
+          ) : (
+            <div>
+              <label className="block text-xs font-semibold text-slate-500 mb-1.5">Admin Password *</label>
+              <div className="relative">
+                <input type={showPw ? 'text' : 'password'} value={form.admin_password}
+                  onChange={e => set('admin_password', e.target.value)}
+                  placeholder="Min 8 characters" className={`${INPUT} pr-10`} />
+                <button type="button" onClick={() => setShowPw(s => !s)}
+                  className="absolute right-3 top-1/2 -translate-y-1/2 text-slate-400 hover:text-slate-600">
+                  {showPw ? <EyeOff size={15} /> : <Eye size={15} />}
+                </button>
+              </div>
             </div>
-          </div>
+          )}
 
           {/* Info box */}
           <div className="bg-indigo-50 dark:bg-indigo-900/20 border border-indigo-200 dark:border-indigo-800 rounded-xl p-3">
             <p className="text-xs text-indigo-700 dark:text-indigo-400 font-semibold mb-1">What happens next:</p>
             <ul className="text-xs text-indigo-600 dark:text-indigo-400 space-y-0.5 list-disc list-inside">
               <li>New PostgreSQL schema created: <code>school_{'{slug}'}</code></li>
-              <li>All {'>'}58 migrations run automatically</li>
+              <li>All migrations run automatically</li>
               <li>Admin user created inside the school</li>
               <li>School code activated for login</li>
+              {form.is_demo && <li>Sample data seeded so the demo looks alive immediately</li>}
             </ul>
           </div>
 
@@ -194,7 +268,7 @@ function CreateSchoolPanel({ onClose, onCreated }) {
             style={{ background: 'linear-gradient(135deg, #6366f1, #8b5cf6)' }}>
             {saving
               ? <><span className="w-4 h-4 border-2 border-white/30 border-t-white rounded-full animate-spin" /> Provisioning…</>
-              : <><Plus size={15} /> Create School</>
+              : <><Plus size={15} /> {form.is_demo ? 'Create Demo' : 'Create School'}</>
             }
           </button>
         </form>
@@ -210,6 +284,22 @@ function EditSchoolPanel({ school, onClose, onSaved }) {
   const [showPw,  setShowPw]  = useState(false);
   const [saving,  setSaving]  = useState(false);
   const [resetting, setResetting] = useState(false);
+  const [converting, setConverting] = useState(false);
+
+  const handleConvertToPaid = async () => {
+    setConverting(true);
+    try {
+      // updateSchool doesn't COALESCE plan/status — send the full explicit object.
+      await updateSchool(school.id, { plan: 'standard', status: 'active', expires_at: null, max_students: school.max_students });
+      toast.success('Converted to a paid Standard plan');
+      onSaved();
+      onClose();
+    } catch (err) {
+      toast.error(err.response?.data?.message || 'Conversion failed');
+    } finally {
+      setConverting(false);
+    }
+  };
 
   const handleUpdate = async (e) => {
     e.preventDefault();
@@ -258,6 +348,19 @@ function EditSchoolPanel({ school, onClose, onSaved }) {
         </div>
 
         <div className="p-6 space-y-6 flex-1">
+          {school.plan === 'trial' && (
+            <div className="bg-amber-50 dark:bg-amber-900/20 border border-amber-200 dark:border-amber-800 rounded-xl p-4 space-y-2">
+              <p className="text-xs font-bold text-amber-700 dark:text-amber-400 uppercase tracking-widest">
+                Trial {school.is_expired ? '· Expired' : `· ${daysLeft(school.expires_at)} day(s) left`}
+              </p>
+              <p className="text-xs text-amber-600 dark:text-amber-500">Keeps the same data — just lifts the 7-day limit and switches billing to Standard.</p>
+              <button onClick={handleConvertToPaid} disabled={converting}
+                className="w-full py-2.5 rounded-xl bg-emerald-500 hover:bg-emerald-600 disabled:opacity-60 text-white text-sm font-semibold transition-colors">
+                {converting ? 'Converting…' : 'Convert to Paid'}
+              </button>
+            </div>
+          )}
+
           {/* Plan & Status */}
           <form onSubmit={handleUpdate} className="space-y-4">
             <p className="text-xs font-bold text-slate-400 uppercase tracking-widest">Subscription</p>
@@ -266,6 +369,7 @@ function EditSchoolPanel({ school, onClose, onSaved }) {
                 <label className="block text-xs font-semibold text-slate-500 mb-1.5">Plan</label>
                 <div className="relative">
                   <select value={form.plan} onChange={e => setForm(f => ({ ...f, plan: e.target.value }))} className={SEL}>
+                    <option value="trial">Trial</option>
                     <option value="standard">Standard</option>
                     <option value="pro">Pro</option>
                     <option value="enterprise">Enterprise</option>
@@ -516,6 +620,11 @@ export default function SuperAdminPage() {
                           <span className={`text-[11px] font-bold px-2.5 py-1 rounded-full capitalize ${PLAN_STYLE[s.plan] || PLAN_STYLE.standard}`}>
                             {s.plan}
                           </span>
+                          {s.plan === 'trial' && (
+                            <p className={`text-[10px] mt-1 font-semibold ${s.is_expired ? 'text-red-500' : 'text-amber-600 dark:text-amber-400'}`}>
+                              {s.is_expired ? 'Trial expired' : `${daysLeft(s.expires_at)} day${daysLeft(s.expires_at) === 1 ? '' : 's'} left`}
+                            </p>
+                          )}
                         </td>
                         <td className="px-4 py-3.5">
                           <span className={`text-[11px] font-bold px-2.5 py-1 rounded-full capitalize ${STATUS_STYLE[s.status] || STATUS_STYLE.active}`}>
