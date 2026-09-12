@@ -1,0 +1,14 @@
+import api from './axios';
+export const getQuizzes         = (p)      => api.get('/quizzes', { params: p });
+export const getQuizById        = (id)     => api.get(`/quizzes/${id}`);
+export const createQuiz         = (data)   => api.post('/quizzes', data);
+export const updateQuiz         = (id, d)  => api.put(`/quizzes/${id}`, d);
+export const deleteQuiz         = (id)     => api.delete(`/quizzes/${id}`);
+export const addQuestion        = (id, d)  => api.post(`/quizzes/${id}/questions`, d);
+export const updateQuestion     = (qid, d) => api.put(`/quizzes/questions/${qid}`, d);
+export const deleteQuestion     = (qid)    => api.delete(`/quizzes/questions/${qid}`);
+export const startAttempt       = (id)     => api.post(`/quizzes/${id}/start`);
+export const submitAttempt      = (id, d)  => api.post(`/quizzes/${id}/submit`, d);
+export const gradeShortAnswers  = (aid, d) => api.put(`/quizzes/attempts/${aid}/grade`, d);
+export const getAttemptResults  = (aid)    => api.get(`/quizzes/attempts/${aid}`);
+export const getQuizResults     = (id)     => api.get(`/quizzes/${id}/results`);

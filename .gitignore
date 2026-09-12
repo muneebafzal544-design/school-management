@@ -1,0 +1,21 @@
+# Claude Code local session config/memory — not project source
+.claude/
+
+# Editor
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Vercel CLI link metadata
+.vercel
+
+# Env files — secrets must never be committed
+.env
+.env.*
+!.env.example
+
+# Node
+node_modules/

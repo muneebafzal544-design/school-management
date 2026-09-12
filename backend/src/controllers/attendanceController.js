@@ -1,0 +1,981 @@
+const pool = require('../db');
+const { buildWorkbook, sendWorkbook } = require('../utils/excelExport');
+const { invalidateDashboard } = require('../utils/cache');
+const { serverErr } = require('../utils/serverErr');
+const { logLifecycleBatch } = require('../services/lifecycleService');
+const { sendTemplate } = require('../services/whatsappService');
+
+/**
+ * Returns true if the teacher owns (is assigned to) the given class.
+ * Admins always pass — call this only when role === 'teacher'.
+ */
+async function teacherOwnsClass(teacherEntityId, classId) {
+  const { rows } = await pool.query(
+    'SELECT 1 FROM teacher_classes WHERE teacher_id = $1 AND class_id = $2 LIMIT 1',
+    [teacherEntityId, classId]
+  );
+  return rows.length > 0;
+}
+
+
+// ─────────────────────────────────────────────────────────────
+//  GET /api/attendance/class-students
+//  Returns all students in a class with their attendance status
+//  for a specific date (and optional period_id).
+//  Query: class_id, date, period_id (optional)
+// ─────────────────────────────────────────────────────────────
+const getClassStudentsAttendance = async (req, res) => {
+  try {
+    const { class_id, date, period_id } = req.query;
+    if (!class_id || !date) {
+      return res.status(400).json({ success: false, message: 'class_id and date are required' });
+    }
+    if (req.user.role === 'teacher' && !(await teacherOwnsClass(req.user.entity_id, class_id))) {
+      return res.status(403).json({ success: false, message: 'You are not assigned to this class.' });
+    }
+
+    const params = [class_id, date];
+    const periodCondition = period_id
+      ? `AND a.period_id = $${params.push(period_id)}`
+      : `AND a.period_id IS NULL`;
+
+    const { rows } = await pool.query(
+      `SELECT
+         s.id, s.full_name, s.roll_number, s.gender, s.b_form_no, s.phone,
+         s.father_name, s.father_phone,
+         a.id         AS att_id,
+         a.status,
+         a.remarks,
+         a.marked_by,
+         a.period_id,
+         a.updated_at
+       FROM students s
+       LEFT JOIN attendance a
+         ON a.entity_type = 'student'
+        AND a.entity_id   = s.id
+        AND a.date        = $2
+        ${periodCondition}
+       WHERE s.class_id = $1 AND s.deleted_at IS NULL
+       ORDER BY s.roll_number NULLS LAST, s.full_name`,
+      params
+    );
+    res.json({ success: true, data: rows, total: rows.length });
+  } catch (err) { serverErr(res, err); }
+};
+
+// ─────────────────────────────────────────────────────────────
+//  GET /api/attendance/teachers-status
+//  Returns all teachers with their attendance for a date.
+//  Query: date
+// ─────────────────────────────────────────────────────────────
+const getTeachersAttendance = async (req, res) => {
+  try {
+    const { date } = req.query;
+    if (!date) return res.status(400).json({ success: false, message: 'date is required' });
+
+    const { rows } = await pool.query(
+      `SELECT
+         t.id, t.full_name, t.subject, t.phone, t.gender, t.status AS teacher_status,
+         a.id      AS att_id,
+         a.status,
+         a.remarks,
+         a.marked_by,
+         a.updated_at
+       FROM teachers t
+       LEFT JOIN attendance a
+         ON a.entity_type = 'teacher'
+        AND a.entity_id   = t.id
+        AND a.date        = $1
+        AND a.period_id IS NULL
+       WHERE t.status = 'active'
+       ORDER BY t.full_name`,
+      [date]
+    );
+    res.json({ success: true, data: rows, total: rows.length });
+  } catch (err) { serverErr(res, err); }
+};
+
+// ─────────────────────────────────────────────────────────────
+//  POST /api/attendance/bulk
+//  Upsert attendance for many students/teachers at once.
+//  Body: { records: [{ entity_type, entity_id, class_id, period_id,
+//                       date, status, remarks, marked_by }] }
+// ─────────────────────────────────────────────────────────────
+const bulkMark = async (req, res) => {
+  const { records } = req.body;
+  if (!Array.isArray(records) || records.length === 0) {
+    return res.status(400).json({ success: false, message: 'records array is required' });
+  }
+
+  if (req.user.role === 'teacher') {
+    const classId = records[0]?.class_id;
+    if (!classId || !(await teacherOwnsClass(req.user.entity_id, classId))) {
+      return res.status(403).json({ success: false, message: 'You are not assigned to this class.' });
+    }
+  }
+
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+
+    const results = [];
+    const errors  = [];
+    for (const r of records) {
+      const { entity_type, entity_id, class_id, period_id, date, status, remarks, marked_by } = r;
+      if (!entity_type || !entity_id || !date || !status) {
+        errors.push({ entity_id, date, reason: 'Missing required field' });
+        continue;
+      }
+
+      const pid = period_id || null;
+      let row;
+      try {
+        // Use savepoint so a single-record failure doesn't abort the whole transaction
+        await client.query('SAVEPOINT sp_attendance');
+        try {
+          const { rows } = await client.query(
+            `INSERT INTO attendance
+               (entity_type, entity_id, class_id, period_id, date, status, remarks, marked_by)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING *`,
+            [entity_type, entity_id, class_id || null, pid,
+             date, status, remarks || null, marked_by || null]
+          );
+          row = rows[0];
+        } catch (e) {
+          if (e.code === '23505') {
+            await client.query('ROLLBACK TO SAVEPOINT sp_attendance');
+            const { rows } = await client.query(
+              `UPDATE attendance
+               SET status=$1, remarks=$2, marked_by=$3, updated_at=NOW()
+               WHERE entity_type=$4 AND entity_id=$5 AND date=$6
+                 AND (period_id = $7 OR (period_id IS NULL AND $7 IS NULL))
+               RETURNING *`,
+              [status, remarks || null, marked_by || null,
+               entity_type, entity_id, date, pid]
+            );
+            row = rows[0];
+          } else {
+            await client.query('ROLLBACK TO SAVEPOINT sp_attendance');
+            errors.push({ entity_id, date, reason: e.detail || e.message });
+            continue;
+          }
+        }
+        await client.query('RELEASE SAVEPOINT sp_attendance');
+      } catch (e) {
+        errors.push({ entity_id, date, reason: e.message });
+        continue;
+      }
+      if (row) results.push(row);
+    }
+
+    await client.query('COMMIT');
+    invalidateDashboard().catch(() => {});
+
+    // Log absent/late students to lifecycle (fire-and-forget, students only)
+    const lcEvents = results
+      .filter(r => r.entity_type === 'student' && (r.status === 'absent' || r.status === 'late'))
+      .map(r => ({
+        studentId:   r.entity_id,
+        eventType:   r.status === 'absent' ? 'attendance_absent' : 'attendance_late',
+        title:       r.status === 'absent' ? `Absent — ${r.date}` : `Late arrival — ${r.date}`,
+        description: r.remarks || null,
+        metadata:    { date: r.date, status: r.status, class_id: r.class_id },
+        performedBy: req.user?.id ?? null,
+      }));
+    if (lcEvents.length) logLifecycleBatch(lcEvents).catch(() => {});
+
+    // WhatsApp absent notifications — fire-and-forget, non-blocking
+    const absentRecords = results.filter(r => r.entity_type === 'student' && r.status === 'absent');
+    if (absentRecords.length) {
+      const absentIds = absentRecords.map(r => r.entity_id);
+      const dateByStudentId = Object.fromEntries(absentRecords.map(r => [r.entity_id, r.date]));
+      (async () => {
+        try {
+          const { rows: students } = await pool.query(
+            `SELECT s.id, s.full_name, s.father_phone, s.phone AS student_phone,
+                    c.name AS class_name
+             FROM students s
+             LEFT JOIN classes c ON c.id = s.class_id
+             WHERE s.id = ANY($1::int[]) AND s.deleted_at IS NULL`,
+            [absentIds]
+          );
+          for (const st of students) {
+            const phone = st.father_phone || st.student_phone;
+            if (!phone) continue;
+            const rawDate = dateByStudentId[st.id];
+            const dateStr = rawDate
+              ? new Date(rawDate).toLocaleDateString('en-PK', { day: '2-digit', month: 'short', year: 'numeric' })
+              : '';
+            await sendTemplate(phone, 'attendance_absent',
+              [st.full_name, st.class_name || '', dateStr],
+              { student_id: st.id, triggered_by: 'attendance_auto' });
+          }
+        } catch { /* non-fatal — attendance was already saved */ }
+      })();
+    }
+
+    res.status(201).json({
+      success: true,
+      saved:   results.length,
+      failed:  errors.length,
+      errors:  errors.length ? errors : undefined,
+      message: errors.length
+        ? `${results.length} records saved, ${errors.length} failed`
+        : `${results.length} records saved`,
+    });
+  } catch (err) {
+    await client.query('ROLLBACK');
+    serverErr(res, err);
+  } finally {
+    client.release();
+  }
+};
+
+// ─────────────────────────────────────────────────────────────
+//  POST /api/attendance  — single record upsert
+// ─────────────────────────────────────────────────────────────
+const markSingle = async (req, res) => {
+  try {
+    const { entity_type, entity_id, class_id, period_id, date, status, remarks, marked_by } = req.body;
+    if (!entity_type || !entity_id || !date || !status) {
+      return res.status(400).json({ success: false, message: 'entity_type, entity_id, date, and status are required' });
+    }
+
+    // Use raw INSERT … ON CONFLICT workaround for partial unique indexes
+    // (PostgreSQL doesn't support ON CONFLICT on partial indexes by name directly in all drivers)
+    // Strategy: try INSERT, catch unique violation (23505), then UPDATE.
+    let row;
+    try {
+      const { rows } = await pool.query(
+        `INSERT INTO attendance
+           (entity_type, entity_id, class_id, period_id, date, status, remarks, marked_by)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+         RETURNING *`,
+        [entity_type, entity_id, class_id || null, period_id || null,
+         date, status, remarks || null, marked_by || null]
+      );
+      row = rows[0];
+    } catch (e) {
+      if (e.code === '23505') {
+        // Already exists — update
+        const { rows } = await pool.query(
+          `UPDATE attendance
+           SET status=$1, remarks=$2, marked_by=$3, updated_at=NOW()
+           WHERE entity_type=$4 AND entity_id=$5 AND date=$6
+             AND (period_id=$7 OR (period_id IS NULL AND $7 IS NULL))
+           RETURNING *`,
+          [status, remarks || null, marked_by || null,
+           entity_type, entity_id, date, period_id || null]
+        );
+        row = rows[0];
+      } else { throw e; }
+    }
+    res.status(201).json({ success: true, data: row });
+  } catch (err) { serverErr(res, err); }
+};
+
+// ─────────────────────────────────────────────────────────────
+//  PUT /api/attendance/:id
+// ─────────────────────────────────────────────────────────────
+const updateAttendance = async (req, res) => {
+  try {
+    const { status, remarks, marked_by } = req.body;
+    const { rows } = await pool.query(
+      `UPDATE attendance SET status=$1, remarks=$2, marked_by=$3, updated_at=NOW()
+       WHERE id=$4 RETURNING *`,
+      [status, remarks || null, marked_by || null, req.params.id]
+    );
+    if (!rows[0]) return res.status(404).json({ success: false, message: 'Record not found' });
+    res.json({ success: true, data: rows[0] });
+  } catch (err) { serverErr(res, err); }
+};
+
+// ─────────────────────────────────────────────────────────────
+//  DELETE /api/attendance/:id
+// ─────────────────────────────────────────────────────────────
+const deleteAttendance = async (req, res) => {
+  try {
+    const { rows } = await pool.query(
+      'DELETE FROM attendance WHERE id=$1 RETURNING id', [req.params.id]
+    );
+    if (!rows[0]) return res.status(404).json({ success: false, message: 'Record not found' });
+    res.json({ success: true, message: 'Deleted' });
+  } catch (err) { serverErr(res, err); }
+};
+
+// ─────────────────────────────────────────────────────────────
+//  GET /api/attendance/monthly
+//  Monthly summary — attendance % per student or teacher.
+//  Query: entity_type (student|teacher), class_id (if student),
+//         month (YYYY-MM), period_id (optional)
+// ─────────────────────────────────────────────────────────────
+const getMonthlySummary = async (req, res) => {
+  try {
+    const { entity_type = 'student', class_id, month, period_id } = req.query;
+    if (!month) return res.status(400).json({ success: false, message: 'month (YYYY-MM) is required' });
+    if (req.user.role === 'teacher' && entity_type === 'student') {
+      if (!class_id || !(await teacherOwnsClass(req.user.entity_id, class_id))) {
+        return res.status(403).json({ success: false, message: 'You are not assigned to this class.' });
+      }
+    }
+
+    const startDate = `${month}-01`;
+    const endDate   = new Date(new Date(startDate).getFullYear(), new Date(startDate).getMonth() + 1, 0)
+      .toISOString().slice(0, 10);
+
+    // periodFilter uses alias "a." for JOIN queries; periodFilterPlain for standalone queries
+    const periodFilter      = period_id ? `AND a.period_id = ${parseInt(period_id)}` : `AND a.period_id IS NULL`;
+    const periodFilterPlain = period_id ? `AND period_id = ${parseInt(period_id)}`   : `AND period_id IS NULL`;
+
+    if (entity_type === 'student') {
+      if (!class_id) return res.status(400).json({ success: false, message: 'class_id required for student report' });
+
+      const { rows } = await pool.query(
+        `SELECT
+           s.id, s.full_name, s.roll_number, s.gender,
+           COUNT(a.id)                                                        AS total_days,
+           COUNT(a.id) FILTER (WHERE a.status = 'present')::int              AS present,
+           COUNT(a.id) FILTER (WHERE a.status = 'absent')::int               AS absent,
+           COUNT(a.id) FILTER (WHERE a.status = 'late')::int                 AS late,
+           COUNT(a.id) FILTER (WHERE a.status = 'excused')::int              AS excused,
+           ROUND(
+             100.0 * COUNT(a.id) FILTER (WHERE a.status IN ('present','late')) /
+             NULLIF(COUNT(a.id), 0), 1
+           ) AS percentage
+         FROM students s
+         LEFT JOIN attendance a
+           ON a.entity_type = 'student' AND a.entity_id = s.id
+           AND a.date BETWEEN $2 AND $3
+           ${periodFilter}
+         WHERE s.class_id = $1 AND s.deleted_at IS NULL
+         GROUP BY s.id, s.full_name, s.roll_number, s.gender
+         ORDER BY s.roll_number NULLS LAST, s.full_name`,
+        [class_id, startDate, endDate]
+      );
+
+      // Working days in the month for this class
+      const { rows: days } = await pool.query(
+        `SELECT COUNT(DISTINCT date)::int AS working_days
+         FROM attendance
+         WHERE entity_type='student' AND class_id=$1
+           AND date BETWEEN $2 AND $3 ${periodFilterPlain}`,
+        [class_id, startDate, endDate]
+      );
+
+      // Use key "rows" (not "data") so axios interceptor won't strip working_days metadata
+      res.json({ success: true, rows, working_days: days[0]?.working_days || 0, month, startDate, endDate });
+    } else {
+      const { rows } = await pool.query(
+        `SELECT
+           t.id, t.full_name, t.subject, t.gender,
+           COUNT(a.id)::int                                                    AS total_days,
+           COUNT(a.id) FILTER (WHERE a.status = 'present')::int               AS present,
+           COUNT(a.id) FILTER (WHERE a.status = 'absent')::int                AS absent,
+           COUNT(a.id) FILTER (WHERE a.status = 'late')::int                  AS late,
+           COUNT(a.id) FILTER (WHERE a.status = 'excused')::int               AS excused,
+           ROUND(
+             100.0 * COUNT(a.id) FILTER (WHERE a.status IN ('present','late')) /
+             NULLIF(COUNT(a.id), 0), 1
+           ) AS percentage
+         FROM teachers t
+         LEFT JOIN attendance a
+           ON a.entity_type = 'teacher' AND a.entity_id = t.id
+           AND a.date BETWEEN $1 AND $2
+           AND a.period_id IS NULL
+         WHERE t.status = 'active'
+         GROUP BY t.id, t.full_name, t.subject, t.gender
+         ORDER BY t.full_name`,
+        [startDate, endDate]
+      );
+
+      const { rows: days } = await pool.query(
+        `SELECT COUNT(DISTINCT date)::int AS working_days
+         FROM attendance
+         WHERE entity_type='teacher' AND date BETWEEN $1 AND $2 AND period_id IS NULL`,
+        [startDate, endDate]
+      );
+
+      res.json({ success: true, rows, working_days: days[0]?.working_days || 0, month, startDate, endDate });
+    }
+  } catch (err) { serverErr(res, err); }
+};
+
+// ─────────────────────────────────────────────────────────────
+//  GET /api/attendance/daily-summary
+//  Quick stats for a date: present/absent/late/excused counts.
+//  Query: date, class_id (optional), entity_type
+// ─────────────────────────────────────────────────────────────
+const getDailySummary = async (req, res) => {
+  try {
+    const { date, class_id, entity_type = 'student' } = req.query;
+    if (!date) return res.status(400).json({ success: false, message: 'date is required' });
+
+    const params = [entity_type, date];
+    let classFilter = '';
+    if (class_id) { params.push(class_id); classFilter = `AND a.class_id = $${params.length}`; }
+
+    const { rows } = await pool.query(
+      `SELECT
+         COUNT(*) FILTER (WHERE status = 'present')::int  AS present,
+         COUNT(*) FILTER (WHERE status = 'absent')::int   AS absent,
+         COUNT(*) FILTER (WHERE status = 'late')::int     AS late,
+         COUNT(*) FILTER (WHERE status = 'excused')::int  AS excused,
+         COUNT(*)::int                                     AS total
+       FROM attendance a
+       WHERE a.entity_type = $1 AND a.date = $2
+         AND a.period_id IS NULL
+         ${classFilter}`,
+      params
+    );
+    res.json({ success: true, data: rows[0] });
+  } catch (err) { serverErr(res, err); }
+};
+
+// ─────────────────────────────────────────────────────────────
+//  GET /api/attendance/export
+//  Returns CSV text for monthly attendance.
+//  Query: same as getMonthlySummary
+// ─────────────────────────────────────────────────────────────
+const exportCSV = async (req, res) => {
+  try {
+    const { entity_type = 'student', class_id, month } = req.query;
+    if (!month) return res.status(400).json({ success: false, message: 'month required' });
+
+    // Re-use monthly summary logic inline
+    const startDate = `${month}-01`;
+    const endDate   = new Date(new Date(startDate).getFullYear(), new Date(startDate).getMonth() + 1, 0)
+      .toISOString().slice(0, 10);
+
+    let rows;
+    if (entity_type === 'student') {
+      if (!class_id) return res.status(400).json({ success: false, message: 'class_id required' });
+      ({ rows } = await pool.query(
+        `SELECT s.roll_number, s.full_name, s.gender,
+                COUNT(a.id) FILTER (WHERE a.status='present')::int  AS present,
+                COUNT(a.id) FILTER (WHERE a.status='absent')::int   AS absent,
+                COUNT(a.id) FILTER (WHERE a.status='late')::int     AS late,
+                COUNT(a.id) FILTER (WHERE a.status='excused')::int  AS excused,
+                COUNT(a.id)::int                                     AS total_days,
+                ROUND(100.0 * COUNT(a.id) FILTER (WHERE a.status IN ('present','late'))
+                  / NULLIF(COUNT(a.id),0), 1)                        AS percentage
+         FROM students s
+         LEFT JOIN attendance a ON a.entity_type='student' AND a.entity_id=s.id
+           AND a.date BETWEEN $2 AND $3 AND a.period_id IS NULL
+         WHERE s.class_id=$1 AND s.deleted_at IS NULL
+         GROUP BY s.id ORDER BY s.roll_number NULLS LAST, s.full_name`,
+        [class_id, startDate, endDate]
+      ));
+    } else {
+      ({ rows } = await pool.query(
+        `SELECT t.full_name, t.subject, t.gender,
+                COUNT(a.id) FILTER (WHERE a.status='present')::int  AS present,
+                COUNT(a.id) FILTER (WHERE a.status='absent')::int   AS absent,
+                COUNT(a.id) FILTER (WHERE a.status='late')::int     AS late,
+                COUNT(a.id) FILTER (WHERE a.status='excused')::int  AS excused,
+                COUNT(a.id)::int                                     AS total_days,
+                ROUND(100.0 * COUNT(a.id) FILTER (WHERE a.status IN ('present','late'))
+                  / NULLIF(COUNT(a.id),0), 1)                        AS percentage
+         FROM teachers t
+         LEFT JOIN attendance a ON a.entity_type='teacher' AND a.entity_id=t.id
+           AND a.date BETWEEN $1 AND $2 AND a.period_id IS NULL
+         WHERE t.status='active'
+         GROUP BY t.id ORDER BY t.full_name`,
+        [startDate, endDate]
+      ));
+    }
+
+    // Build CSV
+    const isStudent = entity_type === 'student';
+    const headers = isStudent
+      ? ['Roll No', 'Full Name', 'Gender', 'Present', 'Absent', 'Late', 'Excused', 'Total Days', 'Attendance %']
+      : ['Full Name', 'Subject', 'Gender', 'Present', 'Absent', 'Late', 'Excused', 'Total Days', 'Attendance %'];
+
+    const csvRows = rows.map(r => isStudent
+      ? [r.roll_number || '', r.full_name, r.gender || '', r.present, r.absent, r.late, r.excused, r.total_days, r.percentage ?? '—']
+      : [r.full_name, r.subject || '', r.gender || '', r.present, r.absent, r.late, r.excused, r.total_days, r.percentage ?? '—']
+    );
+
+    const sanitizeCsv = (v) => {
+      const s = String(v === null || v === undefined ? '' : v);
+      const safe = /^[=+\-@\t\r]/.test(s) ? `'${s}` : s;
+      return `"${safe.replace(/"/g, '""')}"`;
+    };
+    const csv = [headers, ...csvRows]
+      .map(row => row.map(sanitizeCsv).join(','))
+      .join('\n');
+
+    res.setHeader('Content-Type', 'text/csv');
+    res.setHeader('Content-Disposition', `attachment; filename="attendance_${entity_type}_${month}.csv"`);
+    res.send(csv);
+  } catch (err) { serverErr(res, err); }
+};
+
+// ─────────────────────────────────────────────────────────────
+//  GET /api/attendance/student/:id/history
+//  All attendance records for a student (with optional month filter).
+// ─────────────────────────────────────────────────────────────
+const getStudentHistory = async (req, res) => {
+  try {
+    const { month } = req.query;
+    const params = [req.params.id];
+    let dateFilter = '';
+    if (month) {
+      const start = `${month}-01`;
+      const end   = new Date(new Date(start).getFullYear(), new Date(start).getMonth() + 1, 0).toISOString().slice(0,10);
+      params.push(start, end);
+      dateFilter = `AND date BETWEEN $2 AND $3`;
+    }
+    const { rows } = await pool.query(
+      `SELECT * FROM attendance
+       WHERE entity_type='student' AND entity_id=$1 ${dateFilter}
+       ORDER BY date DESC, period_id NULLS FIRST`,
+      params
+    );
+    res.json({ success: true, data: rows, total: rows.length });
+  } catch (err) { serverErr(res, err); }
+};
+
+// ─────────────────────────────────────────────────────────────
+//  GET /api/attendance/register
+//  Printable monthly attendance register for a class.
+//  Query: class_id, month (YYYY-MM)
+//  Returns: class info, students list, all calendar days of month,
+//           per-student day-status map, school settings, summary
+// ─────────────────────────────────────────────────────────────
+const getAttendanceRegister = async (req, res) => {
+  try {
+    const { class_id, month } = req.query;
+    if (!class_id || !month)
+      return res.status(400).json({ success: false, message: 'class_id and month (YYYY-MM) required' });
+    if (req.user.role === 'teacher' && !(await teacherOwnsClass(req.user.entity_id, class_id))) {
+      return res.status(403).json({ success: false, message: 'You are not assigned to this class.' });
+    }
+
+    const startDate = `${month}-01`;
+    const d = new Date(startDate);
+    const endDate = new Date(d.getFullYear(), d.getMonth() + 1, 0).toISOString().slice(0, 10);
+
+    // Build full calendar days array for the month
+    const daysInMonth = new Date(d.getFullYear(), d.getMonth() + 1, 0).getDate();
+    const allDays = [];
+    for (let i = 1; i <= daysInMonth; i++) {
+      const dd = String(i).padStart(2, '0');
+      const mm = String(d.getMonth() + 1).padStart(2, '0');
+      allDays.push(`${d.getFullYear()}-${mm}-${dd}`);
+    }
+
+    // Class info
+    const { rows: classRows } = await pool.query(
+      `SELECT c.id, c.name, c.grade, c.section, t.full_name AS teacher_name
+       FROM classes c LEFT JOIN teachers t ON t.id = c.teacher_id
+       WHERE c.id = $1`,
+      [class_id]
+    );
+    if (!classRows[0]) return res.status(404).json({ success: false, message: 'Class not found' });
+
+    // Students in class
+    const { rows: students } = await pool.query(
+      `SELECT id, full_name, roll_number, gender
+       FROM students
+       WHERE class_id = $1 AND status = 'active' AND deleted_at IS NULL
+       ORDER BY roll_number NULLS LAST, full_name`,
+      [class_id]
+    );
+
+    // All attendance records for this class + month (period_id IS NULL = daily)
+    const { rows: records } = await pool.query(
+      `SELECT entity_id AS student_id, date, status
+       FROM attendance
+       WHERE entity_type = 'student' AND class_id = $1
+         AND date BETWEEN $2 AND $3
+         AND period_id IS NULL
+       ORDER BY date`,
+      [class_id, startDate, endDate]
+    );
+
+    // Build map: studentId → { 'YYYY-MM-DD': 'present'|'absent'|'late'|'excused' }
+    const attendanceMap = {};
+    students.forEach(s => { attendanceMap[s.id] = {}; });
+    records.forEach(r => {
+      const sid = r.student_id;
+      const dt  = r.date instanceof Date ? r.date.toISOString().slice(0, 10) : String(r.date).slice(0, 10);
+      if (attendanceMap[sid] !== undefined) attendanceMap[sid][dt] = r.status;
+    });
+
+    // Days where any record exists (working days)
+    const markedDays = [...new Set(records.map(r => String(r.date).slice(0, 10)))].sort();
+
+    // Per-student summary
+    const studentSummaries = students.map(s => {
+      const dayMap = attendanceMap[s.id] || {};
+      let present = 0, absent = 0, late = 0, excused = 0;
+      markedDays.forEach(dt => {
+        const st = dayMap[dt];
+        if (st === 'present') present++;
+        else if (st === 'absent') absent++;
+        else if (st === 'late') late++;
+        else if (st === 'excused') excused++;
+      });
+      const total = present + absent + late + excused;
+      const pct   = total > 0 ? Math.round((present + late) / total * 100) : null;
+      return { ...s, present, absent, late, excused, total, pct };
+    });
+
+    // School settings
+    const { rows: settingsRows } = await pool.query(
+      `SELECT key, value FROM settings WHERE key IN
+       ('school_name','school_address','school_phone','school_logo')`
+    );
+    const settings = {};
+    settingsRows.forEach(r => { settings[r.key] = r.value; });
+
+    res.json({
+      success: true,
+      data: {
+        class:       classRows[0],
+        month,
+        startDate,
+        endDate,
+        allDays,
+        markedDays,
+        students:    studentSummaries,
+        attendance:  attendanceMap,
+        settings,
+        working_days: markedDays.length,
+      },
+    });
+  } catch (err) { serverErr(res, err); }
+};
+
+// ── GET /api/attendance/export?format=xlsx ───────────────────────
+// Uses ExcelJS streaming writer — rows piped directly to response
+// without buffering the full workbook in memory.
+const exportAttendanceExcel = async (req, res, next) => {
+  try {
+    const { entity_type = 'student', class_id, month, format = 'csv' } = req.query;
+    if (format !== 'xlsx') return exportCSV(req, res, next);
+
+    const ExcelJS      = require('exceljs');
+    const currentMonth = month || new Date().toISOString().slice(0, 7);
+    const [y, m]       = currentMonth.split('-').map(Number);
+    const startDate    = `${currentMonth}-01`;
+    const endDate      = new Date(y, m, 0).toISOString().slice(0, 10);
+    const isTeacher    = entity_type === 'teacher';
+
+    const columns = isTeacher ? [
+      { key: 'full_name',  header: 'Teacher Name', width: 22 },
+      { key: 'subject',    header: 'Subject',      width: 16 },
+      { key: 'gender',     header: 'Gender',       width: 10 },
+      { key: 'present',    header: 'Present',      width: 10 },
+      { key: 'absent',     header: 'Absent',       width: 10 },
+      { key: 'late',       header: 'Late',         width: 8  },
+      { key: 'total_days', header: 'Total Days',   width: 12 },
+    ] : [
+      { key: 'roll_number', header: 'Roll No',     width: 10 },
+      { key: 'full_name',   header: 'Student',     width: 22 },
+      { key: 'class_name',  header: 'Class',       width: 14 },
+      { key: 'grade',       header: 'Grade',       width: 8  },
+      { key: 'section',     header: 'Section',     width: 9  },
+      { key: 'gender',      header: 'Gender',      width: 10 },
+      { key: 'present',     header: 'Present',     width: 10 },
+      { key: 'absent',      header: 'Absent',      width: 10 },
+      { key: 'late',        header: 'Late',        width: 8  },
+      { key: 'total_days',  header: 'Total Days',  width: 12 },
+    ];
+
+    let query, params;
+    if (isTeacher) {
+      query  = `SELECT t.full_name, t.subject, t.gender,
+                  COUNT(*) FILTER (WHERE a.status='present')::int AS present,
+                  COUNT(*) FILTER (WHERE a.status='absent')::int  AS absent,
+                  COUNT(*) FILTER (WHERE a.status='late')::int    AS late,
+                  COUNT(a.id)::int AS total_days
+                FROM teachers t
+                LEFT JOIN attendance a ON a.entity_id = t.id AND a.entity_type='teacher'
+                  AND a.date BETWEEN $1 AND $2
+                WHERE t.deleted_at IS NULL
+                GROUP BY t.id ORDER BY t.full_name`;
+      params = [startDate, endDate];
+    } else {
+      query  = `SELECT s.roll_number, s.full_name, s.gender, s.grade, s.section, c.name AS class_name,
+                  COUNT(*) FILTER (WHERE a.status='present')::int AS present,
+                  COUNT(*) FILTER (WHERE a.status='absent')::int  AS absent,
+                  COUNT(*) FILTER (WHERE a.status='late')::int    AS late,
+                  COUNT(a.id)::int AS total_days
+                FROM students s
+                LEFT JOIN classes c ON c.id = s.class_id
+                LEFT JOIN attendance a ON a.entity_id = s.id AND a.entity_type='student'
+                  AND a.date BETWEEN $1 AND $2
+                WHERE s.deleted_at IS NULL ${class_id ? 'AND s.class_id = $3' : ''}
+                GROUP BY s.id, c.name ORDER BY s.grade, s.roll_number`;
+      params = class_id ? [startDate, endDate, class_id] : [startDate, endDate];
+    }
+
+    // Stream headers before DB query so the download starts immediately
+    const filename = `attendance_${entity_type}_${currentMonth}.xlsx`;
+    res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+    res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+    res.setHeader('Cache-Control', 'no-store');
+
+    const wb = new ExcelJS.stream.xlsx.WorkbookWriter({ stream: res, useStyles: true, useSharedStrings: true });
+    wb.creator = 'School Management System';
+    const sheet = wb.addWorksheet('Attendance', {
+      pageSetup: { paperSize: 9, orientation: 'landscape', fitToPage: true },
+    });
+
+    // Set column metadata (widths + keys)
+    sheet.columns = columns.map(c => ({ header: c.header, key: c.key, width: c.width || 16 }));
+
+    // Style the header row
+    const HEADER_BG = '1E40AF', HEADER_FONT = 'FFFFFF';
+    sheet.getRow(1).eachCell(cell => {
+      cell.font      = { bold: true, size: 11, color: { argb: HEADER_FONT } };
+      cell.fill      = { type: 'pattern', pattern: 'solid', fgColor: { argb: HEADER_BG } };
+      cell.alignment = { horizontal: 'center', vertical: 'middle' };
+    });
+    sheet.getRow(1).commit();
+
+    // Stream rows from DB directly to the xlsx stream
+    const FORMULA_START = /^[=+\-@\t\r]/;
+    const sanitize = v => (typeof v === 'string' && FORMULA_START.test(v)) ? `'${v}` : v;
+
+    const { rows } = await pool.query(query, params);
+    const ALT_ROW_BG = 'EFF6FF';
+    rows.forEach((row, ri) => {
+      const dataRow = sheet.addRow(columns.map(c => {
+        const v = row[c.key];
+        return v === null || v === undefined ? '' : sanitize(v);
+      }));
+      if (ri % 2 === 1) {
+        dataRow.eachCell({ includeEmpty: true }, cell => {
+          cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: ALT_ROW_BG } };
+        });
+      }
+      dataRow.commit();
+    });
+
+    await sheet.commit();
+    await wb.commit();
+  } catch (err) {
+    next(err);
+  }
+};
+
+// ─────────────────────────────────────────────────────────────
+//  GET /api/attendance/teacher-quick-list
+//  Teacher one-tap attendance: returns today's classes with
+//  students pre-populated from existing records + late_arrivals.
+//  All students default to "present"; teacher only taps absent.
+//  Query: teacher_id, date (optional, defaults to today)
+// ─────────────────────────────────────────────────────────────
+const getTeacherQuickList = async (req, res) => {
+  const { teacher_id, date } = req.query;
+  if (!teacher_id) return res.status(400).json({ success: false, message: 'teacher_id required' });
+
+  const targetDate = date || new Date().toISOString().slice(0, 10);
+  // Build day name robustly (avoid timezone shifts by appending noon)
+  const dayName = new Date(`${targetDate}T12:00:00`).toLocaleDateString('en-US', { weekday: 'long' });
+
+  try {
+    // Each class appears once, ordered by first period of the day
+    const { rows: entries } = await pool.query(
+      `SELECT DISTINCT ON (te.class_id)
+         te.class_id,
+         c.name AS class_name, c.grade, c.section,
+         te.subject_id, sub.name AS subject_name,
+         p.period_no, p.start_time, p.end_time
+       FROM timetable_entries te
+       JOIN  classes  c   ON c.id   = te.class_id
+       LEFT JOIN subjects sub ON sub.id  = te.subject_id
+       LEFT JOIN periods  p   ON p.id   = te.period_id
+       WHERE te.teacher_id = $1 AND te.day_of_week = $2
+       ORDER BY te.class_id, p.period_no ASC NULLS LAST`,
+      [teacher_id, dayName]
+    );
+
+    if (entries.length === 0) {
+      return res.json({ success: true, data: { classes: [], date: targetDate, day_name: dayName } });
+    }
+
+    const classesWithStudents = await Promise.all(entries.map(async (entry) => {
+      const [studentsRes, existingRes, lateRes] = await Promise.all([
+        pool.query(
+          `SELECT id, full_name, roll_number, father_name
+           FROM students WHERE class_id = $1 AND status = 'active' AND deleted_at IS NULL
+           ORDER BY roll_number ASC NULLS LAST, full_name ASC`,
+          [entry.class_id]
+        ),
+        pool.query(
+          `SELECT student_id, status, remarks
+           FROM attendance WHERE class_id = $1 AND date = $2 AND period_id IS NULL`,
+          [entry.class_id, targetDate]
+        ),
+        // late_arrivals may not be populated — fail silently
+        pool.query(
+          `SELECT student_id FROM late_arrivals WHERE class_id = $1 AND date = $2`,
+          [entry.class_id, targetDate]
+        ).catch(() => ({ rows: [] })),
+      ]);
+
+      const existingMap = {};
+      existingRes.rows.forEach(r => { existingMap[r.student_id] = r; });
+      const lateSet = new Set(lateRes.rows.map(r => r.student_id));
+
+      const students = studentsRes.rows.map(s => ({
+        id:              s.id,
+        full_name:       s.full_name,
+        roll_number:     s.roll_number,
+        father_name:     s.father_name,
+        // Priority: existing DB record → late arrival → default present
+        status:          existingMap[s.id]?.status  || (lateSet.has(s.id) ? 'late' : 'present'),
+        remarks:         existingMap[s.id]?.remarks || (lateSet.has(s.id) ? 'Late arrival' : ''),
+        is_late_arrival: lateSet.has(s.id),
+        already_marked:  !!existingMap[s.id],
+      }));
+
+      return {
+        class_id:      entry.class_id,
+        class_name:    entry.class_name,
+        grade:         entry.grade,
+        section:       entry.section,
+        subject_name:  entry.subject_name,
+        period_number: entry.period_no,
+        start_time:    entry.start_time,
+        end_time:      entry.end_time,
+        students,
+        total:         students.length,
+        marked_count:  existingRes.rows.length,
+        already_marked: existingRes.rows.length > 0,
+      };
+    }));
+
+    res.json({ success: true, data: { classes: classesWithStudents, date: targetDate, day_name: dayName } });
+  } catch (err) { serverErr(res, err); }
+};
+
+// ── GET /api/attendance/absence-streaks ────────────────────────────────────────
+// Returns students currently on a consecutive-absence streak >= min_days.
+// Query params: min_days (default 3), class_id (optional)
+const getAbsenceStreaks = async (req, res) => {
+  try {
+    const minDays = Math.max(1, parseInt(req.query.min_days) || 3);
+    const classId = req.query.class_id ? parseInt(req.query.class_id) : null;
+
+    // Window-function approach:
+    // 1. Label each absent row with a "group id" = date - row_number (gaps break groups)
+    // 2. Count consecutive absences per student per group
+    // 3. Keep only groups where count >= minDays AND the latest date in group = max date for that student
+    //    (meaning the streak is still ongoing)
+    const { rows } = await pool.query(`
+      WITH absent_rows AS (
+        SELECT
+          a.entity_id AS student_id,
+          a.date,
+          ROW_NUMBER() OVER (PARTITION BY a.entity_id ORDER BY a.date) AS rn,
+          (a.date - (ROW_NUMBER() OVER (PARTITION BY a.entity_id ORDER BY a.date) * INTERVAL '1 day'))::date AS grp
+        FROM attendance a
+        WHERE a.status = 'absent'
+          AND a.entity_type = 'student'
+          ${classId ? 'AND a.class_id = $2' : ''}
+      ),
+      streaks AS (
+        SELECT
+          student_id,
+          grp,
+          COUNT(*)                AS streak_length,
+          MIN(date)               AS streak_start,
+          MAX(date)               AS streak_end
+        FROM absent_rows
+        GROUP BY student_id, grp
+        HAVING COUNT(*) >= $1
+      ),
+      latest_absent AS (
+        SELECT entity_id AS student_id, MAX(date) AS last_absent_date
+        FROM attendance
+        WHERE status = 'absent' AND entity_type = 'student'
+        GROUP BY entity_id
+      )
+      SELECT
+        s.id            AS student_id,
+        s.full_name     AS student_name,
+        s.roll_number,
+        s.father_phone,
+        c.name          AS class_name,
+        c.section,
+        sk.streak_length,
+        sk.streak_start,
+        sk.streak_end
+      FROM streaks sk
+      JOIN latest_absent la ON la.student_id = sk.student_id AND la.last_absent_date = sk.streak_end
+      JOIN students s ON s.id = sk.student_id AND s.deleted_at IS NULL
+      LEFT JOIN classes c ON c.id = s.class_id
+      ORDER BY sk.streak_length DESC, sk.streak_end DESC
+    `, classId ? [minDays, classId] : [minDays]);
+
+    res.json({ success: true, data: rows, total: rows.length, min_days: minDays });
+  } catch (err) { serverErr(res, err); }
+};
+
+// POST /api/attendance/qr-scan
+// Body: { student_id, date, class_id?, period_id? }
+const qrScanAttendance = async (req, res) => {
+  try {
+    const { student_id, date, class_id, period_id } = req.body;
+    if (!student_id || !date) {
+      return res.status(400).json({ success: false, message: 'student_id and date are required' });
+    }
+
+    const { rows: stuRows } = await pool.query(
+      `SELECT id, full_name, class_id FROM students WHERE id = $1 AND deleted_at IS NULL`,
+      [student_id]
+    );
+    if (!stuRows[0]) return res.status(404).json({ success: false, message: 'Student not found' });
+    const student = stuRows[0];
+    const effectiveClassId = class_id || student.class_id;
+
+    // Check existing
+    const { rows: exist } = await pool.query(
+      `SELECT id, status FROM attendance
+       WHERE entity_id=$1 AND entity_type='student' AND date=$2
+         AND (period_id=$3 OR ($3::int IS NULL AND period_id IS NULL))`,
+      [student_id, date, period_id || null]
+    );
+
+    if (exist[0]) {
+      if (exist[0].status === 'present') {
+        return res.json({ success: true, status: 'duplicate', student_name: student.full_name, message: 'Already marked present' });
+      }
+      await pool.query(
+        `UPDATE attendance SET status='present', marked_by=$1, updated_at=NOW() WHERE id=$2`,
+        [req.user?.id || null, exist[0].id]
+      );
+      return res.json({ success: true, status: 'updated', student_name: student.full_name });
+    }
+
+    await pool.query(
+      `INSERT INTO attendance (entity_id, entity_type, class_id, date, status, marked_by, period_id)
+       VALUES ($1,'student',$2,$3,$4,$5,$6)`,
+      [student_id, effectiveClassId, date, 'present', req.user?.id || null, period_id || null]
+    );
+    await invalidateDashboard();
+    res.json({ success: true, status: 'marked', student_name: student.full_name });
+  } catch (err) { serverErr(res, err); }
+};
+
+module.exports = {
+  getClassStudentsAttendance,
+  getTeachersAttendance,
+  bulkMark,
+  markSingle,
+  updateAttendance,
+  deleteAttendance,
+  getMonthlySummary,
+  getDailySummary,
+  exportCSV,
+  exportAttendanceExcel,
+  getStudentHistory,
+  getAttendanceRegister,
+  getTeacherQuickList,
+  getAbsenceStreaks,
+  qrScanAttendance,
+};

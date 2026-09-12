@@ -1,0 +1,46 @@
+@import "tailwindcss";
+
+/* Enable class-based dark mode for Tailwind v4 — ThemeContext toggles .dark on <html> */
+@custom-variant dark (&:where(.dark, .dark *));
+
+@layer base {
+  :root {
+    --bg-color: white;
+    --text-color: black;
+  }
+
+  .dark {
+    --bg-color: #1f2937;   /* gray-800 */
+    --text-color: white;
+  }
+}
+
+@layer components {
+  .custom-element {
+    background-color: var(--bg-color);
+    color: var(--text-color);
+    transition: background-color 0.3s, color 0.3s;
+  }
+
+  .sidebar-scroll {
+    scrollbar-width: thin;
+    scrollbar-color: #334155 transparent;
+  }
+
+  .sidebar-scroll::-webkit-scrollbar {
+    width: 4px;
+  }
+
+  .sidebar-scroll::-webkit-scrollbar-track {
+    background: transparent;
+  }
+
+  .sidebar-scroll::-webkit-scrollbar-thumb {
+    background: #334155;
+    border-radius: 9999px;
+  }
+
+  .sidebar-scroll::-webkit-scrollbar-thumb:hover {
+    background: #475569;
+  }
+}
