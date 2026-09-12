@@ -68,6 +68,7 @@ const createSchool = async (req, res) => {
       phone,
       email,
       admin_username = 'admin',
+      admin_name     = 'Administrator',
       admin_password,
       plan           = 'standard',
     } = req.body;
@@ -109,9 +110,9 @@ const createSchool = async (req, res) => {
     const hash = await bcrypt.hash(admin_password, 10);
     await db.setSearchPath(client, schema);
     await client.query(
-      `INSERT INTO users (username, password, role, must_change_password)
-       VALUES ($1, $2, 'admin', false)`,
-      [admin_username, hash]
+      `INSERT INTO users (username, password, name, role, must_change_password)
+       VALUES ($1, $2, $3, 'admin', false)`,
+      [admin_username, hash, admin_name]
     );
 
     // 6. Seed school_name setting inside the tenant
