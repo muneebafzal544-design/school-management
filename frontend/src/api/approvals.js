@@ -1,4 +1,4 @@
-import api from './api';
+import api from './axios';
 
 export const createWorkflow        = (data)        => api.post('/approvals', data);
 export const getWorkflows          = (params)      => api.get('/approvals', { params });
