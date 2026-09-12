@@ -85,6 +85,7 @@ const automationRoutes        = require('./routes/automationRoutes');
 const studyPlannerRoutes      = require('./routes/studyPlannerRoutes');
 const parentFeedRoutes        = require('./routes/parentFeedRoutes');
 const schoolRoutes            = require('./routes/schoolRoutes');
+const { resolveSchool }       = require('./controllers/schoolController');
 const whatsappRoutes          = require('./routes/whatsappRoutes');
 const riskRoutes              = require('./routes/riskRoutes');
 const auditRoutes             = require('./routes/auditRoutes');
@@ -340,16 +341,16 @@ for (const prefix of ['/api', '/api/v1']) {
   app.use(`${prefix}/auth/login`, loginLimiter);
   app.use(`${prefix}/auth`, authRoutes);
   // School resolve is public — login page calls it before JWT exists.
-  // Mounted at the router's own base path (not .../resolve) so its internal
-  // `/resolve` route actually matches — mounting at `.../schools/resolve`
-  // required the request to be `.../schools/resolve/resolve` to match,
-  // silently falling through to the authenticated mount further down and
-  // returning 401 instead of ever reaching resolveSchool(). The rest of
-  // schoolRoutes (create/list/update) stays safe here too: those routes
-  // carry their own `requireSuperAdmin` guard, which independently checks
-  // `req.user` and rejects when it's unset (global verifyToken hasn't run
-  // yet at this point in the middleware chain).
-  app.use(`${prefix}/schools`, schoolRoutes);
+  // Mount the handler directly rather than the whole schoolRoutes router:
+  // mounting the router here at '.../schools' (matching authRoutes' pattern)
+  // would make it swallow every /api/schools/* request before the global
+  // verifyToken below ever runs, breaking createSchool/listSchools/etc.
+  // (their requireSuperAdmin guard checks req.user, which only exists once
+  // verifyToken has decoded the JWT — never, if this mount intercepts them
+  // first). The previous version mounted the whole router at
+  // '.../schools/resolve', which needed '.../schools/resolve/resolve' to
+  // match — that's the bug this replaces.
+  app.get(`${prefix}/schools/resolve`, resolveSchool);
   // Payment gateway callbacks are public — JazzCash/EasyPaisa POST here (no JWT)
   app.use(`${prefix}/online-payments`, onlinePaymentRoutes);
 }
@@ -428,11 +429,12 @@ const routeMap = [
   ['/automation',           automationRoutes],
   ['/study-planner',        studyPlannerRoutes],
   ['/parent-feed',          parentFeedRoutes],
-  // NOTE: schoolRoutes is mounted earlier (pre-auth, see the public-routes
-  // block above) so its own /resolve route can be reached without a JWT —
-  // it is NOT listed here too, since that mount already handles every
-  // /api/schools/* path (its protected routes still enforce
-  // requireSuperAdmin individually).
+  // schoolRoutes' own '/resolve' route is unreachable here for GET
+  // /api/schools/resolve (the direct public mount above always matches
+  // first) — harmless, since every other route in this router (create,
+  // list, update, reset-admin, seed-demo) still needs the JWT verification
+  // that only happens because this mount comes after the global verifyToken.
+  ['/schools',              schoolRoutes],
   ['/whatsapp',             whatsappRoutes],
   ['/risk',                 riskRoutes],
   ['/audit',                auditRoutes],
